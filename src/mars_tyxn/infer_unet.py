@@ -194,14 +194,24 @@ def _load_model_and_metadata(
         ).to(device)
 
     state = torch.load(str(model_path), map_location=device, weights_only=True)
+    # strict=False would silently load zero weights on prefix mismatch (see
+    # feedback_load_state_dict_prefix). We capture the load result and raise
+    # if any keys are missing or unexpected, mirroring the Stage 1 detector's
+    # audit_loaded_weights pattern.
     result = model.load_state_dict(state, strict=False)
     if result.missing_keys or result.unexpected_keys:
+        missing_sample = result.missing_keys[:5]
+        unexpected_sample = result.unexpected_keys[:5]
+        missing_suffix = "..." if len(result.missing_keys) > 5 else ""
+        unexpected_suffix = "..." if len(result.unexpected_keys) > 5 else ""
         raise RuntimeError(
             f"U-Net load_state_dict mismatch for {model_path}: "
-            f"missing={result.missing_keys[:5]}... ({len(result.missing_keys)} total), "
-            f"unexpected={result.unexpected_keys[:5]}... ({len(result.unexpected_keys)} total). "
-            "Per feedback_load_state_dict_prefix: strict=False would silently load "
-            "zero weights on prefix mismatch. Aborting rather than emit garbage masks."
+            f"missing={missing_sample}{missing_suffix} "
+            f"({len(result.missing_keys)} total), "
+            f"unexpected={unexpected_sample}{unexpected_suffix} "
+            f"({len(result.unexpected_keys)} total). "
+            "strict=False would silently load zero weights on prefix mismatch. "
+            "Aborting rather than emit garbage masks."
         )
     model.eval()
 
