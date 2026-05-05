@@ -97,20 +97,25 @@ def mars_projected_to_latlon(
     raise ValueError(f"Unsupported Mars projection: {wkt[:200]}")
 
 
+def _geo_from_dataset(src) -> Optional[Dict]:
+    """Extract geolocation dict from an open rasterio dataset."""
+    if src.crs is None:
+        return None
+    return {
+        "crs_wkt": src.crs.to_wkt(),
+        "transform": src.transform,
+        "width": src.width,
+        "height": src.height,
+    }
+
+
 def read_jp2_geolocation(image_path: Path) -> Optional[Dict]:
     """Read CRS and affine transform from a JP2 via rasterio."""
     if not HAS_RASTERIO:
         return None
     try:
         with rasterio.open(str(image_path)) as src:
-            if src.crs is None:
-                return None
-            return {
-                "crs_wkt": src.crs.to_wkt(),
-                "transform": src.transform,
-                "width": src.width,
-                "height": src.height,
-            }
+            return _geo_from_dataset(src)
     except Exception:
         return None
 
@@ -244,9 +249,114 @@ def decode_jp2_region(
     return arr
 
 
+def decode_cog_region(
+    cog_dataset, x0: int, y0: int, x1: int, y1: int
+) -> np.ndarray:
+    """Read a window from an open rasterio dataset (local or /vsis3/).
+
+    Parameters
+    ----------
+    cog_dataset
+        An open ``rasterio.DatasetReader`` (e.g. from
+        ``mars_tcp.pds.open_cog``). Either an s3-resident COG via
+        ``/vsis3/`` or a local GeoTIFF.
+    x0, y0, x1, y1
+        Window bounds in pixel coordinates (inclusive of x0, y0;
+        exclusive of x1, y1). Must lie inside ``[0, cog_dataset.width)``
+        and ``[0, cog_dataset.height)``.
+
+    Returns
+    -------
+    np.ndarray
+        Single-band window of shape ``(y1 - y0, x1 - x0)``, native dtype.
+        Caller normalizes to uint8 via ``normalize_robust_uint8``.
+    """
+    from rasterio.windows import Window
+    width = x1 - x0
+    height = y1 - y0
+    window = Window(col_off=x0, row_off=y0, width=width, height=height)
+    return cog_dataset.read(1, window=window)
+
+
 # ---------------------------------------------------------------------------
 # Single-image processing
 # ---------------------------------------------------------------------------
+
+def _process_anchor(
+    raw_tile: np.ndarray,
+    x0: int, y0: int,
+    tile_size: int,
+    parent_id: str,
+    tiles_dir: Path,
+    geo: Optional[Dict],
+    min_valid_ratio: float,
+) -> Tuple[Optional[Dict], bool]:
+    """Process one tile anchor: gate, normalize, write PNG, build CSV row.
+
+    Parameters
+    ----------
+    raw_tile
+        The raw (unnormalized) tile array, shape ``(tile_size, tile_size)``.
+    x0, y0
+        Anchor pixel coordinates (top-left corner of tile).
+    tile_size
+        Tile side length in pixels.
+    parent_id
+        Stem of the parent image filename.
+    tiles_dir
+        Directory to write kept PNG tiles into.
+    geo
+        Geolocation dict (from ``read_jp2_geolocation`` or
+        ``_geo_from_dataset``), or None.
+    min_valid_ratio
+        Fraction of pixels > 3 required to keep the tile.
+
+    Returns
+    -------
+    row : dict or None
+        The CSV metadata row dict, or None if shape is wrong.
+    kept : bool
+        Whether the tile passed the valid-ratio gate (and was written).
+    """
+    if raw_tile.shape != (tile_size, tile_size):
+        return None, False
+
+    x1 = x0 + tile_size
+    y1 = y0 + tile_size
+    key = f"hirise_{parent_id}__y{y0:05d}_x{x0:05d}_s{tile_size}"
+    valid_ratio = float((raw_tile > 3).mean())
+    keep = valid_ratio >= min_valid_ratio
+
+    row: Dict = {
+        "key": key,
+        "parent_id": parent_id,
+        "x0": int(x0),
+        "y0": int(y0),
+        "x1": int(x1),
+        "y1": int(y1),
+        "width": tile_size,
+        "height": tile_size,
+        "valid_ratio": round(valid_ratio, 4),
+        "kept": keep,
+    }
+
+    if geo is not None:
+        lat, lon, e, n = tile_center_latlon(x0, y0, tile_size, geo)
+        row.update({
+            "center_lat": round(lat, 6),
+            "center_lon": round(lon, 6),
+            "center_easting": round(e, 2),
+            "center_northing": round(n, 2),
+        })
+
+    if keep:
+        tile8, _ = normalize_robust_uint8(raw_tile)
+        out_path = tiles_dir / f"{key}.png"
+        if not cv2.imwrite(str(out_path), tile8):
+            raise RuntimeError(f"Failed writing: {out_path}")
+
+    return row, keep
+
 
 def process_one_image(
     image_path: Path,
@@ -255,8 +365,25 @@ def process_one_image(
     overlap: int = 128,
     min_valid_ratio: float = 0.60,
     tmp_dir: Optional[Path] = None,
+    cog_dataset=None,
 ) -> Dict:
-    """Tile one HiRISE JP2 and return a summary dict."""
+    """Tile one HiRISE image and return a summary dict.
+
+    Three decode modes, selected automatically:
+
+    1. **COG** (``cog_dataset`` is not None): reads windows directly from
+       an open ``rasterio.DatasetReader`` (local GeoTIFF or ``/vsis3/``).
+       Used by AWS Batch / GCP Vertex AI / K8s deployments.
+    2. **windowed JP2** (``cog_dataset`` is None, ``.jp2``/``.j2k``/``.jpt``
+       suffix): decodes strips via ``opj_decompress`` subprocess.
+       Arizona.edu download fallback.
+    3. **full-decode** (``cog_dataset`` is None, non-JP2 suffix): loads the
+       entire image into memory via OpenCV.  Used for GeoTIFF inputs and
+       during unit tests.
+
+    The per-anchor normalization and PNG-write logic is shared across all
+    three modes via ``_process_anchor``.
+    """
     stride = tile_size - overlap
     parent_id = image_path.stem
 
@@ -265,24 +392,29 @@ def process_one_image(
     tiles_dir.mkdir(parents=True, exist_ok=True)
 
     is_jp2 = image_path.suffix.lower() in (".jp2", ".j2k", ".jpt")
-    decode_mode = "windowed" if is_jp2 else "full"
+
     if tmp_dir is None:
         tmp_dir = image_dir / ".tmp_jp2"
 
-    # Read geolocation
-    geo = read_jp2_geolocation(image_path)
+    # --- Determine decode mode and read dimensions / geo ---
+    if cog_dataset is not None:
+        decode_mode = "cog"
+        w = cog_dataset.width
+        h = cog_dataset.height
+        geo = _geo_from_dataset(cog_dataset) if HAS_RASTERIO else None
+    elif is_jp2:
+        decode_mode = "windowed"
+        w, h = parse_jp2_dims_with_opj_dump(image_path)
+        geo = read_jp2_geolocation(image_path)
+    else:
+        decode_mode = "full"
+        raw = load_grayscale(image_path)
+        h, w = raw.shape
+        geo = read_jp2_geolocation(image_path)
+
     has_geo = geo is not None
     if not has_geo:
         print(f"  WARNING: No geolocation for {parent_id}")
-
-    # Get image dimensions and optionally load full image
-    if decode_mode == "windowed":
-        w, h = parse_jp2_dims_with_opj_dump(image_path)
-        parent_norm = None
-    else:
-        raw = load_grayscale(image_path)
-        h, w = raw.shape
-        parent_norm, _ = normalize_robust_uint8(raw)
 
     y_anchors = compute_anchors(h, tile_size, stride)
     x_anchors = compute_anchors(w, tile_size, stride)
@@ -294,126 +426,68 @@ def process_one_image(
     # Compute image center coordinates
     image_lat, image_lon = None, None
     if has_geo:
-        image_lat, image_lon, _, _ = tile_center_latlon(
-            w // 2 - tile_size // 2, h // 2 - tile_size // 2, tile_size, geo
-        )
+        try:
+            image_lat, image_lon, _, _ = tile_center_latlon(
+                w // 2 - tile_size // 2, h // 2 - tile_size // 2, tile_size, geo
+            )
+        except (ValueError, Exception):
+            has_geo = False
+            geo = None
+            print(f"  WARNING: Unsupported projection for {parent_id}, disabling geolocation")
 
     rows: List[Dict] = []
     kept = 0
     dropped = 0
 
-    if decode_mode == "windowed":
+    # --- Strip-based decode modes (windowed JP2 and COG) ---
+    if decode_mode in ("windowed", "cog"):
         for yi, y0 in enumerate(y_anchors):
             y1 = y0 + tile_size
-            strip = decode_jp2_region(image_path, 0, y0, w, y1, tmp_dir)
-            if strip.shape != (tile_size, w):
-                raise RuntimeError(
-                    f"Strip shape mismatch at y0={y0}: {strip.shape}"
-                )
+
+            if decode_mode == "windowed":
+                strip = decode_jp2_region(image_path, 0, y0, w, y1, tmp_dir)
+                if strip.shape != (tile_size, w):
+                    raise RuntimeError(
+                        f"Strip shape mismatch at y0={y0}: {strip.shape}"
+                    )
+            else:  # cog
+                strip = decode_cog_region(cog_dataset, 0, y0, w, y1)
 
             for x0 in x_anchors:
-                x1 = x0 + tile_size
-                raw_tile = strip[:, x0:x1]
-                if raw_tile.shape != (tile_size, tile_size):
-                    continue
-
-                key = (
-                    f"hirise_{parent_id}__y{y0:05d}_x{x0:05d}_s{tile_size}"
+                raw_tile = strip[:, x0:x0 + tile_size]
+                row, tile_kept = _process_anchor(
+                    raw_tile, x0, y0, tile_size, parent_id,
+                    tiles_dir, geo, min_valid_ratio,
                 )
-                valid_ratio = float((raw_tile > 3).mean())
-                keep = valid_ratio >= min_valid_ratio
-
-                row: Dict = {
-                    "key": key,
-                    "parent_id": parent_id,
-                    "x0": int(x0),
-                    "y0": int(y0),
-                    "x1": int(x1),
-                    "y1": int(y1),
-                    "width": tile_size,
-                    "height": tile_size,
-                    "valid_ratio": round(valid_ratio, 4),
-                    "kept": keep,
-                }
-
-                if has_geo:
-                    lat, lon, e, n = tile_center_latlon(
-                        x0, y0, tile_size, geo
-                    )
-                    row.update({
-                        "center_lat": round(lat, 6),
-                        "center_lon": round(lon, 6),
-                        "center_easting": round(e, 2),
-                        "center_northing": round(n, 2),
-                    })
-
-                rows.append(row)
-
-                if not keep:
-                    dropped += 1
+                if row is None:
                     continue
-
-                tile8, _ = normalize_robust_uint8(raw_tile)
-                out_path = tiles_dir / f"{key}.png"
-                if not cv2.imwrite(str(out_path), tile8):
-                    raise RuntimeError(f"Failed writing: {out_path}")
-                kept += 1
+                rows.append(row)
+                if tile_kept:
+                    kept += 1
+                else:
+                    dropped += 1
 
             if (yi + 1) % 10 == 0 or (yi + 1) == len(y_anchors):
                 print(
                     f"  Strip {yi + 1}/{len(y_anchors)}, "
                     f"kept {kept} tiles so far"
                 )
-    else:
+
+    else:  # full-decode
         for y0 in y_anchors:
             for x0 in x_anchors:
-                x1 = x0 + tile_size
-                y1 = y0 + tile_size
-                raw_tile = raw[y0:y1, x0:x1]
-                tile = parent_norm[y0:y1, x0:x1]
-                if raw_tile.shape != (tile_size, tile_size):
-                    continue
-
-                key = (
-                    f"hirise_{parent_id}__y{y0:05d}_x{x0:05d}_s{tile_size}"
+                raw_tile = raw[y0:y0 + tile_size, x0:x0 + tile_size]
+                row, tile_kept = _process_anchor(
+                    raw_tile, x0, y0, tile_size, parent_id,
+                    tiles_dir, geo, min_valid_ratio,
                 )
-                valid_ratio = float((raw_tile > 3).mean())
-                keep = valid_ratio >= min_valid_ratio
-
-                row = {
-                    "key": key,
-                    "parent_id": parent_id,
-                    "x0": int(x0),
-                    "y0": int(y0),
-                    "x1": int(x1),
-                    "y1": int(y1),
-                    "width": tile_size,
-                    "height": tile_size,
-                    "valid_ratio": round(valid_ratio, 4),
-                    "kept": keep,
-                }
-
-                if has_geo:
-                    lat, lon, e, n = tile_center_latlon(
-                        x0, y0, tile_size, geo
-                    )
-                    row.update({
-                        "center_lat": round(lat, 6),
-                        "center_lon": round(lon, 6),
-                        "center_easting": round(e, 2),
-                        "center_northing": round(n, 2),
-                    })
-
-                rows.append(row)
-
-                if not keep:
-                    dropped += 1
+                if row is None:
                     continue
-
-                out_path = tiles_dir / f"{key}.png"
-                if not cv2.imwrite(str(out_path), tile):
-                    raise RuntimeError(f"Failed writing: {out_path}")
-                kept += 1
+                rows.append(row)
+                if tile_kept:
+                    kept += 1
+                else:
+                    dropped += 1
 
     # Write per-image tile metadata CSV
     if rows:
@@ -424,7 +498,7 @@ def process_one_image(
             writer.writeheader()
             writer.writerows(rows)
 
-    # Clean up temp dir
+    # Clean up temp dir (windowed JP2 only)
     if decode_mode == "windowed":
         try:
             tmp_dir.rmdir()
