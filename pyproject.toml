@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mars-tyxn-classifier"
+version = "0.1.0"
+description = "Mars TYXN junction classifier (Foerder et al. 2026, JGR ML&C) — pip-installable fork of the Zenodo v7 package."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Andrew B. Foerder"},
+]
+keywords = ["mars", "hirise", "thermal-contraction-polygons", "fracture", "junction-classification", "machine-learning"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+    "Pillow>=9.0",
+    "opencv-python-headless>=4.8",
+    "joblib>=1.3",
+    "matplotlib>=3.7",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "scikit-image>=0.21",
+    # The v7 stacking pickle (stacking_gauss40_best.pkl) was trained with
+    # scikit-learn >= 1.6.1; cross-minor deserialization on 1.5.x produces
+    # InconsistentVersionWarning and silently mis-deserializes meta-features.
+    # Pin to the matching minor.
+    "scikit-learn>=1.6,<1.7",
+    "tqdm>=4.65",
+    "xgboost>=2.0",
+    "segmentation-models-pytorch>=0.3.3",
+    "timm>=0.9.0",
+]
+
+[project.optional-dependencies]
+geo = ["rasterio>=1.3"]
+
+[project.urls]
+Paper = "https://doi.org/10.5281/zenodo.19167443"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["mars_tyxn*"]
+
+[tool.setuptools.package-data]
+mars_tyxn = ["*.json"]
