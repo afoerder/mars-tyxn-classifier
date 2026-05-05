@@ -194,10 +194,15 @@ def _load_model_and_metadata(
         ).to(device)
 
     state = torch.load(str(model_path), map_location=device, weights_only=True)
-    try:
-        model.load_state_dict(state)
-    except RuntimeError:
-        model.load_state_dict(state, strict=False)
+    result = model.load_state_dict(state, strict=False)
+    if result.missing_keys or result.unexpected_keys:
+        raise RuntimeError(
+            f"U-Net load_state_dict mismatch for {model_path}: "
+            f"missing={result.missing_keys[:5]}... ({len(result.missing_keys)} total), "
+            f"unexpected={result.unexpected_keys[:5]}... ({len(result.unexpected_keys)} total). "
+            "Per feedback_load_state_dict_prefix: strict=False would silently load "
+            "zero weights on prefix mismatch. Aborting rather than emit garbage masks."
+        )
     model.eval()
 
     _MODEL_CACHE[cache_key] = (model, config, threshold, image_size, encoder_type)
