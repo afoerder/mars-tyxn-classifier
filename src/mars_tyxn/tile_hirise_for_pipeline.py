@@ -430,7 +430,9 @@ def process_one_image(
             image_lat, image_lon, _, _ = tile_center_latlon(
                 w // 2 - tile_size // 2, h // 2 - tile_size // 2, tile_size, geo
             )
-        except (ValueError, Exception):
+        except ValueError:
+            # mars_projected_to_latlon raises ValueError on unsupported CRS.
+            # Production: log warning, disable geolocation, continue producing tiles.
             has_geo = False
             geo = None
             print(f"  WARNING: Unsupported projection for {parent_id}, disabling geolocation")
