@@ -27,7 +27,12 @@ classifiers = [
 dependencies = [
     "numpy>=1.24",
     "torch>=2.0",
-    "Pillow>=9.0",
+    # Aligned with MarsTCPDetection's `pillow>=10.0,<12.0` pin so the
+    # cross-repo intersection tightens to a single supported range and
+    # standalone installs don't silently pull a different image-decode
+    # backend than the cloud pipeline. (ultrareview IM-DEPLOY-2,
+    # 2026-05-07.)
+    "Pillow>=10.0,<12.0",
     "opencv-python-headless>=4.8",
     "joblib>=1.3",
     "matplotlib>=3.7",
