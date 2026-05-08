@@ -292,6 +292,19 @@ def _validate_local_bridge(
         trace_len=6,
         merge_deg=20.0,
     )
+
+    branch_count = int(local["branch_count"])
+    min_gap = local["min_gap_deg"]
+    max_gap = local["max_gap_deg"]
+    if branch_count != 3:
+        # Strict was previously computed unconditionally before this branch
+        # but its result is unused on this return path. Lazy-defer to save
+        # ~50% of strict-analyze calls in the typical post-Win-#1 profile.
+        # analyze_local_junction is pure w.r.t. its `binary` input
+        # (junction_geometry.py:121 makes a local copy via astype), so
+        # reordering preserves output bit-for-bit.
+        return {"accepted": False, "reason": "branch_count_not_3"}
+
     strict = analyze_local_junction(
         binary=repaired,
         anchor_x=cx,
@@ -299,12 +312,6 @@ def _validate_local_bridge(
         trace_len=6,
         merge_deg=15.0,
     )
-
-    branch_count = int(local["branch_count"])
-    min_gap = local["min_gap_deg"]
-    max_gap = local["max_gap_deg"]
-    if branch_count != 3:
-        return {"accepted": False, "reason": "branch_count_not_3"}
     if int(strict["branch_count"]) >= 4:
         return {"accepted": False, "reason": "fourth_branch_detected"}
     if min_gap is None or float(min_gap) < 20.0:
